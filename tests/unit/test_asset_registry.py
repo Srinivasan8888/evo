@@ -140,6 +140,14 @@ class TestPureRegistry(unittest.TestCase):
         self.assertEqual(asset_env_for_exp(reg, "exp_0002"),
                          {"EVO_ASSET_MODEL": "s3://b/model.bin"})
 
+    def test_asset_env_for_exp_uses_resolver(self):
+        # The CLI passes a resolver that maps remote assets to their cached path.
+        reg = empty_registry()
+        registry_put(reg, self._entry("model", consumed_by=["exp_0002"]))
+        self.assertEqual(
+            asset_env_for_exp(reg, "exp_0002", resolve=lambda e: "/cache/" + e["name"]),
+            {"EVO_ASSET_MODEL": "/cache/model"})
+
 
 if __name__ == "__main__":
     unittest.main()

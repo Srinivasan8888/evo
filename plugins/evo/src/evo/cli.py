@@ -636,6 +636,19 @@ def cmd_asset_get(args: argparse.Namespace) -> int:
     return 0
 
 
+def _asset_run_value(root: Path, entry: dict) -> str | None:
+    """The value EVO_ASSET_<NAME> gets in a run: a local path (remote assets are
+    fetched into the cache, normally already warm from `evo asset use`). If the
+    fetch fails, fall back to the stored uri so a run is never blocked -- the
+    recipe can `evo asset get` it and see the real error."""
+    from . import assets as _assets
+
+    try:
+        return _resolve_asset_local_path(root, entry["name"], entry)
+    except Exception:
+        return _assets.asset_location(entry)
+
+
 def _resolve_asset_local_path(root: Path, name: str, entry: dict) -> str:
     """Return a local path for an asset. Local assets return their stored path;
     remote assets download to a per-asset cache (reusing an existing copy)."""
@@ -693,15 +706,30 @@ def cmd_asset_use(args: argparse.Namespace) -> int:
     root = repo_root()
     _require_workspace(root)
     name = args.name.strip()
+    entry = _assets.load_registry(root).get("assets", {}).get(name)
+    if entry is None:
+        raise RuntimeError(f"unknown asset: {args.name}")
+    # Fetch remote assets into the cache first, outside the lock (transfers are
+    # slow; advisory_lock gives up after 10s). A failed fetch records nothing.
+    local = _resolve_asset_local_path(root, name, entry)
     with advisory_lock(lock_file_for(_assets.assets_path(root))):
         reg = _assets.load_registry(root)
-        try:
-            entry = _assets.registry_record_use(reg, name, args.exp)
-        except KeyError:
+        current = reg.get("assets", {}).get(name)
+        if current is None:
             raise RuntimeError(f"unknown asset: {args.name}")
+        # rm + re-put during the fetch would make `local` belong to the old asset.
+        # Compare identity fields only: consumed_by changes whenever any other
+        # experiment uses the asset, which is not a reason to fail.
+        def identity(e):
+            return (e.get("path"), e.get("uri"), e.get("created_at"))
+        if identity(current) != identity(entry):
+            raise RuntimeError(
+                f"asset {name!r} changed while it was being fetched; "
+                f"retry `evo asset use`")
+        _assets.registry_record_use(reg, name, args.exp)
         _assets.save_registry(root, reg)
     env_var = _assets.asset_env_var(name)
-    print(f"asset {name} used by {args.exp}; runs see {env_var}={_assets.asset_location(entry)}")
+    print(f"asset {name} used by {args.exp}; runs see {env_var}={local}")
     return 0
 
 
@@ -2838,7 +2866,9 @@ def _runtime_env_for_attempt(
     try:
         from . import assets as _assets
 
-        env.update(_assets.asset_env_for_exp(_assets.load_registry(root), exp_id))
+        env.update(_assets.asset_env_for_exp(
+            _assets.load_registry(root), exp_id,
+            resolve=lambda e: _asset_run_value(root, e)))
     except Exception:
         pass
     return env

@@ -15,7 +15,7 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .core import atomic_write_json, workspace_path
 
@@ -114,14 +114,20 @@ def registry_remove(reg: dict[str, Any], name: str, force: bool = False) -> dict
     return assets.pop(name)
 
 
-def asset_env_for_exp(reg: dict[str, Any], exp_id: str) -> dict[str, str]:
+def asset_env_for_exp(
+    reg: dict[str, Any],
+    exp_id: str,
+    resolve: Callable[[dict[str, Any]], str | None] | None = None,
+) -> dict[str, str]:
     """Env vars to inject for a run: one EVO_ASSET_<NAME> per asset the
-    experiment consumes. Local assets map to their path; remote assets have no
-    local copy yet, so they expose the uri (the recipe resolves it via
-    `evo asset get`)."""
+    experiment consumes. `resolve` maps an entry to the value the run sees; the
+    default is its stored location (path, else uri), which is all this pure
+    layer knows. The CLI passes a resolver that fetches remote assets into the
+    local cache so the variable is a usable local path."""
+    resolve = resolve or asset_location
     out: dict[str, str] = {}
     for e in registry_filter(reg, consumed_by=exp_id):
-        value = asset_location(e)
+        value = resolve(e)
         if value:
             out[asset_env_var(e["name"])] = value
     return out

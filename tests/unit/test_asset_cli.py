@@ -217,21 +217,14 @@ class TestAssetCli(unittest.TestCase):
         self.assertNotEqual(out, "None")
         self.assertEqual(Path(out).read_text(), "weights")
 
-    def test_list_and_use_show_uri_for_remote_asset(self):
-        _FakeRemoteBackend._store = {}
-        uri = "s3://bucket/models/remote-adapter.bin"
-        with mock.patch("evo.asset_backends.backend_for_uri",
-                        return_value=_FakeRemoteBackend()):
-            cmd_asset_put(_put_args(self.asset_file, "remote-adapter", "checkpoint",
-                                    backend=uri))
+    def test_list_shows_uri_for_remote_asset(self):
+        # (`use` no longer prints the uri: it fetches and reports the local cache
+        # path -- see test_use_remote_downloads_and_reports_local_path.)
+        uri = self._put_remote()
         listed = self._capture(cmd_asset_list, argparse.Namespace(
             kind=None, tag=[], produced_by=None, consumed_by=None, json=False))
         self.assertIn(uri, listed)
         self.assertNotIn("None", listed)
-        used = self._capture(cmd_asset_use, argparse.Namespace(
-            name="remote-adapter", exp="exp_0002"))
-        self.assertIn(uri, used)
-        self.assertNotIn("None", used)
 
     def test_get_nested_remote_path_reuses_cache(self):
         # Backends that keep the remote subpath (HF) must still hit the cache on
@@ -324,6 +317,129 @@ class TestAssetCli(unittest.TestCase):
         cmd_asset_put(_put_args(self.asset_file, "plainlocal", "checkpoint"))
         cmd_asset_rm(argparse.Namespace(name="plainlocal", force=False))
         self.assertNotIn("plainlocal", load_registry(self.root)["assets"])
+
+    # --- use/run env resolve remote assets to the local cache (spec) -----------
+
+    def _run_env(self, exp_id="exp_0002"):
+        from evo.cli import _runtime_env_for_attempt
+        from evo.core import load_config
+        return _runtime_env_for_attempt(
+            self.root, load_config(self.root), exp_id=exp_id, attempt_label="001",
+            worktree=self.root, env_traces_dir="t", env_result_path="r.json",
+            env_checkpoint_dir="ck")
+
+    def _put_remote(self, name="remote-adapter", uri="s3://bucket/models/a.bin"):
+        _FakeRemoteBackend._store = {}
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            cmd_asset_put(_put_args(self.asset_file, name, "checkpoint", backend=uri))
+        return uri
+
+    def test_use_remote_downloads_and_reports_local_path(self):
+        self._put_remote()
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            out = self._capture(cmd_asset_use, argparse.Namespace(
+                name="remote-adapter", exp="exp_0002"))
+        local = out.split("EVO_ASSET_REMOTE_ADAPTER=", 1)[1]
+        self.assertIn("_cache", Path(local).parts)
+        self.assertEqual(Path(local).read_text(), "weights")
+
+    def test_use_remote_fetch_failure_records_nothing(self):
+        self._put_remote()
+
+        class _Down(_FakeRemoteBackend):
+            def download(self, uri, dest_dir):
+                raise OSError("network down")
+
+        with mock.patch("evo.asset_backends.backend_for_uri", return_value=_Down()):
+            with self.assertRaises(OSError):
+                cmd_asset_use(argparse.Namespace(name="remote-adapter", exp="exp_0002"))
+        self.assertEqual(
+            load_registry(self.root)["assets"]["remote-adapter"]["consumed_by"], [])
+
+    def _use_racing(self, during_fetch):
+        """Run `use` for exp_0002 while `during_fetch(name)` mutates the registry
+        after the fetch but before the consumption is recorded."""
+        import evo.cli as cli
+        real = cli._resolve_asset_local_path
+
+        def racing(root, name, entry):
+            path = real(root, name, entry)
+            during_fetch(name)
+            return path
+
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()), \
+             mock.patch("evo.cli._resolve_asset_local_path", side_effect=racing):
+            cmd_asset_use(argparse.Namespace(name="remote-adapter", exp="exp_0002"))
+
+    def test_use_fails_if_asset_replaced_while_fetching(self):
+        # rm + re-put at another uri mid-fetch: the fetched path belongs to the
+        # OLD asset, so recording use against the new one would be wrong.
+        self._put_remote()
+        other = self.root / "other.bin"
+        other.write_text("other")
+
+        def replace(name):
+            cmd_asset_rm(argparse.Namespace(name=name, force=False))
+            with mock.patch("evo.asset_backends.backend_for_uri",
+                            return_value=_FakeRemoteBackend()):
+                cmd_asset_put(_put_args(other, name, "checkpoint",
+                                        backend="s3://other/a.bin"))
+
+        with self.assertRaises(RuntimeError):
+            self._use_racing(replace)
+        self.assertEqual(
+            load_registry(self.root)["assets"]["remote-adapter"]["consumed_by"], [])
+
+    def test_use_tolerates_concurrent_use_by_another_experiment(self):
+        # Another experiment consuming the same asset mid-fetch changes
+        # consumed_by but not the asset's identity; it must not fail spuriously.
+        from evo.assets import load_registry as _load, registry_record_use, save_registry
+        self._put_remote()
+
+        def other_exp_uses(name):
+            reg = _load(self.root)
+            registry_record_use(reg, name, "exp_0009")
+            save_registry(self.root, reg)
+
+        self._use_racing(other_exp_uses)
+        self.assertEqual(
+            load_registry(self.root)["assets"]["remote-adapter"]["consumed_by"],
+            ["exp_0009", "exp_0002"])
+
+    def test_run_env_points_remote_asset_at_cached_path(self):
+        self._put_remote()
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            cmd_asset_use(argparse.Namespace(name="remote-adapter", exp="exp_0002"))
+            value = self._run_env()["EVO_ASSET_REMOTE_ADAPTER"]
+        self.assertIn("_cache", Path(value).parts)
+        self.assertEqual(Path(value).read_text(), "weights")
+
+    def test_run_env_falls_back_to_uri_when_fetch_fails(self):
+        # A run must never be blocked by a fetch failure; the recipe can still
+        # `evo asset get` the uri and see the real error.
+        from evo.assets import clear_asset_cache
+        uri = self._put_remote()
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            cmd_asset_use(argparse.Namespace(name="remote-adapter", exp="exp_0002"))
+        clear_asset_cache(self.root, "remote-adapter")
+
+        class _Down(_FakeRemoteBackend):
+            def download(self, uri, dest_dir):
+                raise OSError("network down")
+
+        with mock.patch("evo.asset_backends.backend_for_uri", return_value=_Down()):
+            env = self._run_env()
+        self.assertEqual(env["EVO_ASSET_REMOTE_ADAPTER"], uri)
+
+    def test_run_env_local_asset_path_unchanged(self):
+        cmd_asset_put(_put_args(self.asset_file, "adapter", "checkpoint"))
+        cmd_asset_use(argparse.Namespace(name="adapter", exp="exp_0002"))
+        self.assertEqual(self._run_env()["EVO_ASSET_ADAPTER"], str(self.asset_file))
 
     def test_put_backend_uploads_outside_registry_lock(self):
         # advisory_lock gives up after 10s; a big upload under it would fail every
