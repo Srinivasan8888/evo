@@ -48,6 +48,15 @@ class TestPureRegistry(unittest.TestCase):
         with self.assertRaises(ValueError):
             registry_put(empty_registry(), self._entry("m", kind=""))
 
+    def test_put_rejects_env_var_collision(self):
+        # 'a-b' and 'a_b' both become EVO_ASSET_A_B; the second must be refused
+        # rather than silently shadowing the first in a run's environment.
+        reg = empty_registry()
+        registry_put(reg, self._entry("a-b"))
+        with self.assertRaises(ValueError):
+            registry_put(reg, self._entry("a_b"))
+        registry_put(reg, self._entry("a-b", kind="dataset"))  # same name still replaces
+
     def test_filter_by_kind(self):
         reg = empty_registry()
         registry_put(reg, self._entry("m1", kind="model"))

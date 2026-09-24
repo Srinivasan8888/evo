@@ -10,6 +10,7 @@ live at the bottom and mirror the locking/atomic-write conventions used by
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -30,10 +31,14 @@ def empty_registry() -> dict[str, Any]:
 
 def normalize_asset_name(name: str) -> str:
     """Canonical form of an asset handle (trimmed). Raises on empty/blank so the
-    stored key, the entry's name field, and every lookup agree on one form."""
+    stored key, the entry's name field, and every lookup agree on one form.
+    The name is also used as a directory (`put --copy`, remote cache), so path
+    separators and dot-names are rejected to keep it inside the assets dir."""
     normalized = str(name or "").strip()
     if not normalized:
         raise ValueError("asset name must be non-empty")
+    if normalized in {".", ".."} or "/" in normalized or "\\" in normalized:
+        raise ValueError(f"asset name must not contain path separators: {normalized!r}")
     return normalized
 
 
@@ -46,6 +51,13 @@ def registry_put(reg: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
     name = normalize_asset_name(entry.get("name") or "")
     if not str(entry.get("kind") or "").strip():
         raise ValueError("asset kind must be non-empty")
+    # Distinct names can slug to one env var ('a-b' / 'a_b'); one would silently
+    # shadow the other in a run's environment, so refuse the second.
+    key = asset_env_var(name)
+    clash = next((n for n in reg.get("assets", {})
+                  if n != name and asset_env_var(n) == key), None)
+    if clash:
+        raise ValueError(f"asset name {name!r} maps to {key}, already used by {clash!r}")
     entry["name"] = name
     reg.setdefault("assets", {})[name] = entry
     return entry
@@ -109,10 +121,16 @@ def asset_env_for_exp(reg: dict[str, Any], exp_id: str) -> dict[str, str]:
     `evo asset get`)."""
     out: dict[str, str] = {}
     for e in registry_filter(reg, consumed_by=exp_id):
-        value = e.get("path") or e.get("uri")
+        value = asset_location(e)
         if value:
             out[asset_env_var(e["name"])] = value
     return out
+
+
+def asset_location(entry: dict[str, Any]) -> str | None:
+    """Where an asset lives: its local path, else its remote uri (remote assets
+    have `path: None`, so callers must not read `entry['path']` directly)."""
+    return entry.get("path") or entry.get("uri")
 
 
 def asset_env_var(name: str) -> str:
@@ -141,9 +159,27 @@ def assets_dir(root: Path) -> Path:
     return workspace_path(root) / "assets"
 
 
-def assets_cache_dir(root: Path, name: str) -> Path:
-    """Local cache dir where a remote asset is downloaded on `get`/`use`."""
+def _cache_root(root: Path, name: str) -> Path:
     return assets_dir(root) / "_cache" / name
+
+
+def assets_cache_dir(root: Path, name: str, uri: str) -> Path:
+    """Local cache dir where a remote asset is downloaded on `get`/`use`. Keyed
+    by uri as well as name, so a handle re-pointed at another uri never serves
+    the previous uri's cached bytes (same-uri re-puts: see clear_asset_cache)."""
+    digest = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:16]
+    return _cache_root(root, name) / digest
+
+
+def clear_asset_cache(root: Path, name: str) -> None:
+    """Drop every downloaded copy of `name` so the cache never outlives its
+    registry entry: a later put at the SAME uri uploads new bytes there, and a
+    stale copy would keep being served. Raises if a copy can't be deleted, so the
+    caller must not drop the registry entry in that case."""
+    try:
+        shutil.rmtree(_cache_root(root, name))
+    except FileNotFoundError:
+        pass  # local asset, or never fetched: nothing cached
 
 
 def load_registry(root: Path) -> dict[str, Any]:

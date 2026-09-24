@@ -546,21 +546,43 @@ def cmd_asset_put(args: argparse.Namespace) -> int:
     source = Path(args.path)
     if not source.exists():
         raise RuntimeError(f"asset path does not exist: {source}")
+    backend_uri = getattr(args, "backend", None)
+    if backend_uri and not source.is_file():
+        raise RuntimeError(f"--backend uploads a single file; {source} is not a file")
+    if not str(args.kind or "").strip():
+        raise RuntimeError("asset kind must be non-empty")  # before any upload
     tags = dict(_assets.parse_tag(t) for t in (args.tag or []))
-    with advisory_lock(lock_file_for(_assets.assets_path(root))):
+    registry_lock = lock_file_for(_assets.assets_path(root))
+
+    def load_with_free_name() -> dict:
         reg = _assets.load_registry(root)
         if name in reg.get("assets", {}):
             raise RuntimeError(
                 f"asset {name!r} already exists; "
                 f"`evo asset rm {name}` first or pick another name"
             )
-        backend_uri = getattr(args, "backend", None)
+        return reg
+
+    if backend_uri:
+        # Upload OUTSIDE the registry lock: advisory_lock gives up after 10s and a
+        # large checkpoint takes longer, which would fail every concurrent
+        # `evo asset` call. The name is pre-checked so a taken name never has its
+        # remote object overwritten; a same-name race is re-checked below.
+        # ponytail: a racing same-name put still uploads before losing; add a
+        # reserve-then-upload step if that ever bites.
+        from . import asset_backends
+        be = asset_backends.backend_for_uri(backend_uri)
+        with advisory_lock(registry_lock):
+            # Dry-run the real registration rules (name taken, env-var collision)
+            # on a throwaway registry so nothing is uploaded that can't register.
+            _assets.registry_put(load_with_free_name(),
+                                 {"name": name, "kind": args.kind})
+        be.upload(source, backend_uri)
+    with advisory_lock(registry_lock):
+        reg = load_with_free_name()
         if backend_uri:
-            # Remote-backed asset: upload the local file to S3/HF and record the
-            # canonical uri; `get`/`use` download it back to a local cache.
-            from . import asset_backends
-            be = asset_backends.backend_for_uri(backend_uri)
-            be.upload(source, backend_uri)
+            # Remote-backed asset: record the canonical uri; `get`/`use`
+            # download it back to a local cache.
             scheme = backend_uri.split("://", 1)[0] if "://" in backend_uri else "local"
             entry = {
                 "name": name,
@@ -619,14 +641,18 @@ def _resolve_asset_local_path(root: Path, name: str, entry: dict) -> str:
     remote assets download to a per-asset cache (reusing an existing copy)."""
     from . import assets as _assets
 
-    if (entry.get("backend") or "local") == "local":
+    # Key on `path`, not backend name: a plain-path `--backend` records
+    # backend="local" with path=None and must still resolve via its uri.
+    if entry.get("path"):
         return entry["path"]
     from . import asset_backends
 
     uri = entry["uri"]
-    cache = _assets.assets_cache_dir(root, name)
-    cached = cache / uri.rstrip("/").split("/")[-1]
-    if not cached.exists():
+    cache = _assets.assets_cache_dir(root, name, uri)
+    # Search the cache tree: HF keeps the remote subpath under it, S3/local don't.
+    base = uri.rstrip("/").split("/")[-1]
+    cached = next((p for p in cache.rglob("*") if p.name == base and p.is_file()), None)
+    if cached is None:
         cached = asset_backends.backend_for_uri(uri).download(uri, cache)
     return str(cached)
 
@@ -653,7 +679,7 @@ def cmd_asset_list(args: argparse.Namespace) -> int:
     for e in sorted(entries, key=lambda x: x["name"]):
         tagstr = ",".join(f"{k}={v}" for k, v in (e.get("tags") or {}).items())
         print(
-            f"{e['name']}\t{e['kind']}\t{e['path']}"
+            f"{e['name']}\t{e['kind']}\t{_assets.asset_location(e)}"
             f"\tproduced_by={e.get('produced_by') or '-'}"
             f"\tconsumed_by={','.join(e.get('consumed_by') or []) or '-'}"
             f"\t{tagstr}"
@@ -675,7 +701,7 @@ def cmd_asset_use(args: argparse.Namespace) -> int:
             raise RuntimeError(f"unknown asset: {args.name}")
         _assets.save_registry(root, reg)
     env_var = _assets.asset_env_var(name)
-    print(f"asset {name} used by {args.exp}; runs see {env_var}={entry['path']}")
+    print(f"asset {name} used by {args.exp}; runs see {env_var}={_assets.asset_location(entry)}")
     return 0
 
 
@@ -691,6 +717,11 @@ def cmd_asset_rm(args: argparse.Namespace) -> int:
             _assets.registry_remove(reg, name, force=getattr(args, "force", False))
         except KeyError:
             raise RuntimeError(f"unknown asset: {args.name}")
+        # Before the save: if the cache can't be deleted, fail with the entry still
+        # registered -- dropping it would leave stale bytes a later put at the same
+        # uri would serve. (Deleting files is cheap next to the transfers that
+        # filled the cache, so it fits the lock's 10s budget.)
+        _assets.clear_asset_cache(root, name)
         _assets.save_registry(root, reg)
     print(f"asset {name} removed")
     return 0

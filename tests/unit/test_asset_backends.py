@@ -55,6 +55,13 @@ class TestDispatch(unittest.TestCase):
     def test_hf_for_hf_scheme(self):
         self.assertIsInstance(backend_for_uri("hf://org/m/f", client=object()), HFBackend)
 
+    def test_unsupported_scheme_rejected(self):
+        # Must not fall through to LocalBackend, which would copy into a local
+        # directory literally named "gs:".
+        for uri in ("gs://b/k", "https://host/f.bin", "az://c/b"):
+            with self.assertRaises(ValueError, msg=uri):
+                backend_for_uri(uri)
+
 
 class TestLocalBackend(unittest.TestCase):
     def setUp(self):

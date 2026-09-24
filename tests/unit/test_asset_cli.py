@@ -57,6 +57,20 @@ class _FakeRemoteBackend:
         return uri in type(self)._store
 
 
+class _FakeNestedBackend(_FakeRemoteBackend):
+    """Like huggingface_hub(local_dir=...): keeps the repo subpath under dest_dir
+    (the flat fake above hides that), and counts downloads."""
+    downloads = 0
+
+    def download(self, uri, dest_dir):
+        type(self).downloads += 1
+        rel = uri.split("://", 1)[1].split("/", 2)[2]  # drop owner/name
+        dest = Path(dest_dir) / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(type(self)._store[uri])
+        return dest
+
+
 class TestAssetCli(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -192,6 +206,183 @@ class TestAssetCli(unittest.TestCase):
         cmd_asset_put(_put_args(self.asset_file, "adapter", "checkpoint"))
         entry = load_registry(self.root)["assets"]["adapter"]
         self.assertEqual(entry.get("backend", "local"), "local")
+
+    def test_backend_plain_path_get_returns_local_path(self):
+        # A plain-path --backend records backend="local" with path=None; get must
+        # still resolve to a real local file, not print "None".
+        store = self.root / "store" / "adapter.bin"
+        cmd_asset_put(_put_args(self.asset_file, "adapter", "checkpoint",
+                                backend=str(store)))
+        out = self._capture(cmd_asset_get, argparse.Namespace(name="adapter"))
+        self.assertNotEqual(out, "None")
+        self.assertEqual(Path(out).read_text(), "weights")
+
+    def test_list_and_use_show_uri_for_remote_asset(self):
+        _FakeRemoteBackend._store = {}
+        uri = "s3://bucket/models/remote-adapter.bin"
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            cmd_asset_put(_put_args(self.asset_file, "remote-adapter", "checkpoint",
+                                    backend=uri))
+        listed = self._capture(cmd_asset_list, argparse.Namespace(
+            kind=None, tag=[], produced_by=None, consumed_by=None, json=False))
+        self.assertIn(uri, listed)
+        self.assertNotIn("None", listed)
+        used = self._capture(cmd_asset_use, argparse.Namespace(
+            name="remote-adapter", exp="exp_0002"))
+        self.assertIn(uri, used)
+        self.assertNotIn("None", used)
+
+    def test_get_nested_remote_path_reuses_cache(self):
+        # Backends that keep the remote subpath (HF) must still hit the cache on
+        # the second get instead of re-downloading every time.
+        _FakeNestedBackend._store = {}
+        _FakeNestedBackend.downloads = 0
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeNestedBackend()):
+            cmd_asset_put(_put_args(self.asset_file, "nested", "checkpoint",
+                                    backend="hf://org/model/ckpt/epoch2/a.bin"))
+            first = self._capture(cmd_asset_get, argparse.Namespace(name="nested"))
+            second = self._capture(cmd_asset_get, argparse.Namespace(name="nested"))
+        self.assertEqual(first, second)
+        self.assertEqual(Path(second).read_text(), "weights")
+        self.assertEqual(_FakeNestedBackend.downloads, 1)
+
+    def test_put_backend_validates_before_uploading(self):
+        _FakeRemoteBackend._store = {}
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            with self.assertRaises((ValueError, RuntimeError)):
+                cmd_asset_put(_put_args(self.asset_file, "x", "  ",
+                                        backend="s3://bucket/x.bin"))
+        self.assertEqual(_FakeRemoteBackend._store, {})
+
+    def test_put_backend_rejects_directory(self):
+        _FakeRemoteBackend._store = {}
+        d = self.root / "somedir"
+        d.mkdir()
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            with self.assertRaises(RuntimeError):
+                cmd_asset_put(_put_args(d, "dirasset", "dataset",
+                                        backend="s3://bucket/d"))
+        self.assertEqual(_FakeRemoteBackend._store, {})
+
+    def test_get_does_not_serve_stale_cache_after_repoint(self):
+        # rm + put the same handle at a different uri with the same basename:
+        # get must fetch the new bytes, not the previous uri's cached copy.
+        _FakeRemoteBackend._store = {}
+        new_file = self.root / "new.bin"
+        new_file.write_text("new-weights")
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            cmd_asset_put(_put_args(self.asset_file, "ckpt", "checkpoint",
+                                    backend="s3://run-a/model.bin"))
+            first = self._capture(cmd_asset_get, argparse.Namespace(name="ckpt"))
+            first_bytes = Path(first).read_text()  # rm below drops this cached copy
+            cmd_asset_rm(argparse.Namespace(name="ckpt", force=False))
+            cmd_asset_put(_put_args(new_file, "ckpt", "checkpoint",
+                                    backend="s3://run-b/model.bin"))
+            second = self._capture(cmd_asset_get, argparse.Namespace(name="ckpt"))
+        self.assertEqual(first_bytes, "weights")
+        self.assertEqual(Path(second).read_text(), "new-weights")
+
+    def test_rm_then_reput_same_uri_serves_fresh_bytes(self):
+        # Iterating on a checkpoint at a fixed key: rm + put uploads new bytes to
+        # the SAME uri, so a cache keyed only by uri would still serve the old file.
+        _FakeRemoteBackend._store = {}
+        uri = "s3://bucket/best.bin"
+        new_file = self.root / "newer.bin"
+        new_file.write_text("newer-weights")
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            cmd_asset_put(_put_args(self.asset_file, "best", "checkpoint", backend=uri))
+            first = self._capture(cmd_asset_get, argparse.Namespace(name="best"))
+            cmd_asset_rm(argparse.Namespace(name="best", force=False))
+            self.assertFalse(Path(first).exists())  # rm drops the downloaded copy
+            cmd_asset_put(_put_args(new_file, "best", "checkpoint", backend=uri))
+            second = self._capture(cmd_asset_get, argparse.Namespace(name="best"))
+        self.assertEqual(Path(second).read_text(), "newer-weights")
+
+    def test_rm_keeps_entry_when_cache_cannot_be_cleared(self):
+        # If the cached copy can't be deleted (e.g. Windows file lock), rm must
+        # fail with the entry still registered; dropping it would leave stale
+        # bytes that a later put at the same uri would serve.
+        _FakeRemoteBackend._store = {}
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            cmd_asset_put(_put_args(self.asset_file, "held", "checkpoint",
+                                    backend="s3://bucket/held.bin"))
+            self._capture(cmd_asset_get, argparse.Namespace(name="held"))
+        with mock.patch("evo.assets.shutil.rmtree", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                cmd_asset_rm(argparse.Namespace(name="held", force=False))
+        self.assertIn("held", load_registry(self.root)["assets"])
+
+    def test_rm_local_asset_without_cache_succeeds(self):
+        # Local assets never populate a cache; clearing a missing dir is a no-op.
+        cmd_asset_put(_put_args(self.asset_file, "plainlocal", "checkpoint"))
+        cmd_asset_rm(argparse.Namespace(name="plainlocal", force=False))
+        self.assertNotIn("plainlocal", load_registry(self.root)["assets"])
+
+    def test_put_backend_uploads_outside_registry_lock(self):
+        # advisory_lock gives up after 10s; a big upload under it would fail every
+        # concurrent `evo asset` call. Upload must not hold the registry lock.
+        from evo.core import lock_file_for
+        from evo.locking import advisory_lock
+
+        root = self.root
+        held = []
+
+        class _ProbingBackend(_FakeRemoteBackend):
+            def upload(self, local, uri):
+                try:
+                    with advisory_lock(lock_file_for(assets_path(root)),
+                                       timeout_seconds=0.3):
+                        held.append(False)
+                except Exception:
+                    held.append(True)
+                super().upload(local, uri)
+
+        _FakeRemoteBackend._store = {}
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_ProbingBackend()):
+            cmd_asset_put(_put_args(self.asset_file, "big", "checkpoint",
+                                    backend="s3://bucket/big.bin"))
+        self.assertEqual(held, [False])
+        self.assertIn("big", load_registry(self.root)["assets"])
+
+    def test_put_backend_taken_name_does_not_upload(self):
+        # A taken name must be rejected before the upload can overwrite a remote
+        # object.
+        _FakeRemoteBackend._store = {}
+        cmd_asset_put(_put_args(self.asset_file, "taken", "model"))
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            with self.assertRaises(RuntimeError):
+                cmd_asset_put(_put_args(self.asset_file, "taken", "model",
+                                        backend="s3://bucket/taken.bin"))
+        self.assertEqual(_FakeRemoteBackend._store, {})
+
+    def test_put_backend_env_var_collision_does_not_upload(self):
+        # 'a_b' would shadow 'a-b' (both EVO_ASSET_A_B); that must be refused
+        # before the upload, not after it leaves an orphaned remote object.
+        _FakeRemoteBackend._store = {}
+        cmd_asset_put(_put_args(self.asset_file, "a-b", "model"))
+        with mock.patch("evo.asset_backends.backend_for_uri",
+                        return_value=_FakeRemoteBackend()):
+            with self.assertRaises((ValueError, RuntimeError)):
+                cmd_asset_put(_put_args(self.asset_file, "a_b", "model",
+                                        backend="s3://bucket/a_b.bin"))
+        self.assertEqual(_FakeRemoteBackend._store, {})
+        self.assertNotIn("a_b", load_registry(self.root)["assets"])
+
+    def test_put_rejects_path_separators_in_name(self):
+        # The name becomes a directory under the workspace (--copy / remote
+        # cache), so it must not be able to escape it.
+        for bad in ("../evil", "a/b", "a\\b", "..", "."):
+            with self.assertRaises(RuntimeError, msg=bad):
+                cmd_asset_put(_put_args(self.asset_file, bad, "model", copy=True))
 
 
 if __name__ == "__main__":

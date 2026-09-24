@@ -169,4 +169,8 @@ def backend_for_uri(uri: str, *, client: Any | None = None):
         return S3Backend(client=client)
     if uri.startswith("hf://"):
         return HFBackend(client=client)
+    if "://" in uri and not uri.startswith("file://"):
+        # Otherwise `gs://b/k` would be copied to a local dir literally named `gs:`.
+        raise ValueError(
+            f"unsupported asset backend in {uri!r}; use s3://, hf://, file://, or a plain path")
     return LocalBackend()
