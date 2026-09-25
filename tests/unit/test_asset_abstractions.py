@@ -266,8 +266,14 @@ class TestDescendantPids(unittest.TestCase):
         parent = subprocess.Popen([PY, "-c", spawn])
         kids = []
         try:
-            time.sleep(2.5)  # let the child spawn and the process table settle
-            kids = _descendant_pids(parent.pid)
+            # Poll instead of sleeping once: on a loaded Windows runner the child
+            # can be slow to spawn, and the PowerShell process-table query
+            # (capped at 10s inside _descendant_pids) can time out and return []
+            # on an attempt.
+            deadline = time.monotonic() + 45
+            while not kids and time.monotonic() < deadline:
+                time.sleep(1)
+                kids = _descendant_pids(parent.pid)
             self.assertTrue(len(kids) >= 1, f"expected >=1 descendant, got {kids}")
         finally:
             # captured before killing the parent (descendants reparent on kill);
