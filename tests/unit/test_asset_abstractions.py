@@ -258,18 +258,24 @@ class TestDescendantPids(unittest.TestCase):
         from evo.cli import _descendant_pids
         # parent python spawns a child python that sleeps, then sleeps itself.
         # A python child (not the `sleep` binary) keeps this portable to Windows.
+        # The parent also prints the child's pid, so the child can be killed in
+        # `finally` even when _descendant_pids finds nothing.
         spawn = (
             "import subprocess, sys, time; "
-            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
-            "time.sleep(30)"
+            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print(c.pid, flush=True); "
+            "time.sleep(60)"
         )
-        parent = subprocess.Popen([PY, "-c", spawn])
+        parent = subprocess.Popen([PY, "-c", spawn], stdout=subprocess.PIPE, text=True)
         kids = []
+        child_pid = None
         try:
+            child_pid = int(parent.stdout.readline())
             # Poll instead of sleeping once: on a loaded Windows runner the child
             # can be slow to spawn, and the PowerShell process-table query
             # (capped at 10s inside _descendant_pids) can time out and return []
-            # on an attempt.
+            # on an attempt. The tree above lives 60s, so it outlives this 45s
+            # window (a shorter-lived tree would exit before the polling ends).
             deadline = time.monotonic() + 45
             while not kids and time.monotonic() < deadline:
                 time.sleep(1)
@@ -278,10 +284,11 @@ class TestDescendantPids(unittest.TestCase):
         finally:
             # captured before killing the parent (descendants reparent on kill);
             # os.kill(pid, 9) maps to TerminateProcess on Windows.
-            for pid in kids:
+            for pid in {p for p in (child_pid, *kids) if p}:
                 try:
                     os.kill(pid, 9)
                 except OSError:
                     pass
             parent.kill()
             parent.wait(timeout=5)
+            parent.stdout.close()
