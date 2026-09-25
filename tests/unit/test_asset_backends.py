@@ -7,7 +7,6 @@ touched.
 from __future__ import annotations
 
 import tempfile
-import types
 import unittest
 from pathlib import Path
 
@@ -87,6 +86,29 @@ class TestLocalBackend(unittest.TestCase):
     def test_upload_copies_to_target(self):
         target = self.d / "out" / "dest.bin"
         LocalBackend().upload(self.src, str(target))
+        self.assertEqual(target.read_text(), "payload")
+
+    def test_file_uri_with_remote_host_is_rejected(self):
+        # `file://tmp/x` (a typo for file:///tmp/x) or a UNC-style host must not
+        # be silently resolved by dropping the host; only local URIs are supported.
+        for uri in ("file://otherhost/tmp/x.bin", "file://tmp/x.bin"):
+            with self.assertRaises(ValueError, msg=uri):
+                LocalBackend().exists(uri)
+
+    def test_file_uri_is_percent_decoded(self):
+        # Path.as_uri() percent-encodes (a space becomes %20) and, on Windows,
+        # yields file:///C:/...; both must map back to the real path.
+        spaced = self.d / "my models"
+        spaced.mkdir()
+        f = spaced / "a b.bin"
+        f.write_text("payload")
+        be = LocalBackend()
+        self.assertIn("%20", f.as_uri())
+        self.assertTrue(be.exists(f.as_uri()))
+        out = be.download(f.as_uri(), self.d / "cache")
+        self.assertEqual(Path(out).read_text(), "payload")
+        target = spaced / "new file.bin"
+        be.upload(self.src, target.as_uri())
         self.assertEqual(target.read_text(), "payload")
 
 

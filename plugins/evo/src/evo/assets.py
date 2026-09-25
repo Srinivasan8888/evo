@@ -10,6 +10,7 @@ live at the bottom and mirror the locking/atomic-write conventions used by
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -165,6 +166,17 @@ def assets_dir(root: Path) -> Path:
     return workspace_path(root) / "assets"
 
 
+NAME_LOCK_TIMEOUT_SECONDS = 10.0
+
+
+def asset_name_lock(root: Path, name: str) -> Path:
+    """Lock file that reserves one asset name for the whole of a `put`, including
+    its slow remote upload, without holding the registry-wide lock. Hashed so any
+    valid asset name is a safe filename on every platform."""
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+    return assets_dir(root) / "_locks" / f"{digest}.lock"
+
+
 def _cache_root(root: Path, name: str) -> Path:
     return assets_dir(root) / "_cache" / name
 
@@ -200,6 +212,18 @@ def load_registry(root: Path) -> dict[str, Any]:
 
 def save_registry(root: Path, reg: dict[str, Any]) -> None:
     atomic_write_json(assets_path(root), reg)
+
+
+def discard_copy(path: Path) -> None:
+    """Best-effort removal of exactly the copy `materialize` returned (never
+    raises, so it can't mask the error that triggered it). The asset's directory
+    is removed only if that leaves it empty: anything else there isn't ours."""
+    with contextlib.suppress(OSError):
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+        path.parent.rmdir()  # fails (and is ignored) unless now empty
 
 
 def materialize(root: Path, name: str, source: Path) -> Path:

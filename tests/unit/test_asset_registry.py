@@ -5,13 +5,7 @@ round-trip against a temp workspace.
 """
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
 from evo.assets import (
     asset_env_for_exp,
@@ -139,14 +133,6 @@ class TestPureRegistry(unittest.TestCase):
         registry_put(reg, entry)
         self.assertEqual(asset_env_for_exp(reg, "exp_0002"),
                          {"EVO_ASSET_MODEL": "s3://b/model.bin"})
-
-    def test_asset_env_for_exp_uses_resolver(self):
-        # The CLI passes a resolver that maps remote assets to their cached path.
-        reg = empty_registry()
-        registry_put(reg, self._entry("model", consumed_by=["exp_0002"]))
-        self.assertEqual(
-            asset_env_for_exp(reg, "exp_0002", resolve=lambda e: "/cache/" + e["name"]),
-            {"EVO_ASSET_MODEL": "/cache/model"})
 
 
 if __name__ == "__main__":

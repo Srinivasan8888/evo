@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -77,7 +78,7 @@ from .core import (
     remove_worktree_only,
     render_git_diff,
 )
-from .locking import advisory_lock
+from .locking import LockTimeoutError, advisory_lock
 from .report import build_report
 from .scratchpad import build_scratchpad
 
@@ -547,6 +548,10 @@ def cmd_asset_put(args: argparse.Namespace) -> int:
     if not source.exists():
         raise RuntimeError(f"asset path does not exist: {source}")
     backend_uri = getattr(args, "backend", None)
+    if backend_uri and "://" not in backend_uri:
+        raise RuntimeError(
+            f"--backend must be a URI (s3://..., hf://..., file://...), got "
+            f"{backend_uri!r}; omit --backend to register a local path")
     if backend_uri and not source.is_file():
         raise RuntimeError(f"--backend uploads a single file; {source} is not a file")
     if not str(args.kind or "").strip():
@@ -563,62 +568,85 @@ def cmd_asset_put(args: argparse.Namespace) -> int:
             )
         return reg
 
-    if backend_uri:
-        # Upload OUTSIDE the registry lock: advisory_lock gives up after 10s and a
-        # large checkpoint takes longer, which would fail every concurrent
-        # `evo asset` call. The name is pre-checked so a taken name never has its
-        # remote object overwritten; a same-name race is re-checked below.
-        # ponytail: a racing same-name put still uploads before losing; add a
-        # reserve-then-upload step if that ever bites.
-        from . import asset_backends
-        be = asset_backends.backend_for_uri(backend_uri)
+    with contextlib.ExitStack() as reservation:
+        # Reserve the name for the whole put, including a slow remote upload, with
+        # a per-name lock rather than the registry-wide one (advisory_lock gives
+        # up after 10s, and a large checkpoint takes longer). It is an OS lock, so
+        # it dies with the process: no stale reservations. A concurrent put of the
+        # same name is refused here, before it can upload anything.
+        try:
+            reservation.enter_context(advisory_lock(
+                _assets.asset_name_lock(root, name),
+                timeout_seconds=_assets.NAME_LOCK_TIMEOUT_SECONDS))
+        except LockTimeoutError:
+            raise RuntimeError(
+                f"another `evo asset put` of {name!r} is in progress; "
+                f"wait for it to finish, then retry") from None
+        be = None
+        if backend_uri:
+            from . import asset_backends
+            be = asset_backends.backend_for_uri(backend_uri)
         with advisory_lock(registry_lock):
             # Dry-run the real registration rules (name taken, env-var collision)
-            # on a throwaway registry so nothing is uploaded that can't register.
+            # on a throwaway registry, so nothing is uploaded or copied that
+            # can't register (a taken name never has its remote object
+            # overwritten, and a rejected put leaves no orphan copy).
             _assets.registry_put(load_with_free_name(),
                                  {"name": name, "kind": args.kind})
-        be.upload(source, backend_uri)
-    with advisory_lock(registry_lock):
-        reg = load_with_free_name()
-        if backend_uri:
-            # Remote-backed asset: record the canonical uri; `get`/`use`
-            # download it back to a local cache.
-            scheme = backend_uri.split("://", 1)[0] if "://" in backend_uri else "local"
-            entry = {
-                "name": name,
-                "kind": args.kind,
-                "path": None,
-                "uri": backend_uri,
-                "backend": scheme,
-                "tags": tags,
-                "produced_by": args.exp,
-                "consumed_by": [],
-                "copied": False,
-                "created_at": utc_now(),
-            }
-            location = backend_uri
-        else:
-            if getattr(args, "copy", False):
-                path = _assets.materialize(root, name, source)
-                copied = True
+        # Heavy I/O -- a big upload or `--copy` -- runs OUTSIDE the registry lock
+        # so it never fails concurrent `evo asset` calls; the name reservation
+        # above keeps this name ours meanwhile.
+        copied_path = None
+        registered = False
+        if be is not None:
+            be.upload(source, backend_uri)
+        elif getattr(args, "copy", False):
+            copied_path = _assets.materialize(root, name, source)
+
+            def discard_unregistered_copy():
+                if not registered:
+                    _assets.discard_copy(copied_path)
+
+            # A put that fails before the registry is saved must not leave its
+            # copy behind. Registered only once the copy exists, so a copy that
+            # itself fails midway never deletes a file it hadn't overwritten yet.
+            reservation.callback(discard_unregistered_copy)
+        with advisory_lock(registry_lock):
+            reg = load_with_free_name()
+            if backend_uri:
+                # Remote-backed asset: record the canonical uri; `get`/`use`
+                # download it back to a local cache.
+                entry = {
+                    "name": name,
+                    "kind": args.kind,
+                    "path": None,
+                    "uri": backend_uri,
+                    "backend": backend_uri.split("://", 1)[0],
+                    "tags": tags,
+                    "produced_by": args.exp,
+                    "consumed_by": [],
+                    "copied": False,
+                    "created_at": utc_now(),
+                }
+                location = backend_uri
             else:
-                path = source.resolve()
-                copied = False
-            entry = {
-                "name": name,
-                "kind": args.kind,
-                "path": str(path),
-                "uri": None,
-                "backend": "local",
-                "tags": tags,
-                "produced_by": args.exp,
-                "consumed_by": [],
-                "copied": copied,
-                "created_at": utc_now(),
-            }
-            location = path
-        _assets.registry_put(reg, entry)
-        _assets.save_registry(root, reg)
+                path = copied_path or source.resolve()
+                entry = {
+                    "name": name,
+                    "kind": args.kind,
+                    "path": str(path),
+                    "uri": None,
+                    "backend": "local",
+                    "tags": tags,
+                    "produced_by": args.exp,
+                    "consumed_by": [],
+                    "copied": copied_path is not None,
+                    "created_at": utc_now(),
+                }
+                location = path
+            _assets.registry_put(reg, entry)
+            _assets.save_registry(root, reg)
+            registered = True
     print(f"asset {name} registered ({args.kind}) -> {location}")
     return 0
 
@@ -654,8 +682,7 @@ def _resolve_asset_local_path(root: Path, name: str, entry: dict) -> str:
     remote assets download to a per-asset cache (reusing an existing copy)."""
     from . import assets as _assets
 
-    # Key on `path`, not backend name: a plain-path `--backend` records
-    # backend="local" with path=None and must still resolve via its uri.
+    # Local assets carry a path; remote ones (s3/hf/file) only a uri.
     if entry.get("path"):
         return entry["path"]
     from . import asset_backends

@@ -11,6 +11,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 
 # --- pure URI parsing ------------------------------------------------------
@@ -41,7 +43,17 @@ def parse_hf_uri(uri: str) -> tuple[str, str]:
 
 
 def _strip_file_scheme(uri: str) -> str:
-    return uri[len("file://"):] if uri.startswith("file://") else uri
+    """`file:///a%20b/c` -> '/a b/c' (percent-decoded; `file:///C:/x` -> 'C:\\x'
+    on Windows). A non-file:// value is already a plain path. Only local file
+    URIs are supported: a host other than `localhost` is rejected rather than
+    silently dropped (which would resolve `file://tmp/x` to `/x`)."""
+    if not uri.startswith("file://"):
+        return uri
+    parsed = urlparse(uri)
+    if parsed.netloc not in ("", "localhost"):
+        raise ValueError(
+            f"file:// URI must be local (file:///path); got host {parsed.netloc!r} in {uri!r}")
+    return url2pathname(parsed.path)
 
 
 # --- backends --------------------------------------------------------------
